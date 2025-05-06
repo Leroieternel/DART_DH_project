@@ -72,6 +72,9 @@ class OptimArgs:
 
 import torch.nn.functional as F
 def calc_point_sdf(scene_assets, points):
+
+    # TODO what is scene assets, do we need to change it or can we load it in volumetricSMPL?
+
     device = points.device
     scene_sdf_config = scene_assets['scene_sdf_config']
     scene_sdf_grid = scene_assets['scene_sdf_grid']
@@ -221,6 +224,10 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
         negative_sdf_per_frame = (joints_sdf - joint_skin_dist.reshape(1, 1, 22)).clamp(max=0).sum(
             dim=-1)  # [B, T], clip negative sdf, sum over joints
         negative_sdf_mean = negative_sdf_per_frame.mean()
+
+        # TODO: probably need to change things here
+        # https://github.com/markomih/VolumetricSMPL_applications/blob/main/tutorials/scene_collisions.py
+
         loss_collision = -negative_sdf_mean
         loss_joints = criterion(motion_sequences['joints'][:, -1, joints_mask], goal_joints[:, joints_mask])
         loss_jerk = calc_jerk(motion_sequences['joints'])
@@ -290,6 +297,12 @@ if __name__ == '__main__':
     scene_dir = Path(interaction_cfg['scene_dir'])
     scene_dir = Path(scene_dir)
     scene_with_floor_mesh = trimesh.load(scene_dir / 'scene_with_floor.obj', process=False, force='mesh')
+
+    # TODO: load like this?
+    # scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
+    # scene_normals = torch.from_numpy(np.asarray(scene_with_floor_mesh.vertex_normals).copy()).to(device=device, dtype=torch.float)
+    # Now what? scene_assets?
+
     with open(scene_dir / 'scene_sdf.json', 'r') as f:
         scene_sdf_config = json.load(f)
     scene_sdf_grid = np.load(scene_dir / 'scene_sdf.npy')
@@ -425,6 +438,3 @@ if __name__ == '__main__':
                 np.savez(f, **data_dict)
 
     print(f'[Done] Results are at [{out_path.absolute()}]')
-
-
-
