@@ -37,6 +37,8 @@ from mld.train_mvae import DataArgs, TrainArgs
 from mld.train_mld import DenoiserArgs, MLDArgs, create_gaussian_diffusion, DenoiserMLPArgs, DenoiserTransformerArgs
 from mld.rollout_mld import load_mld, ClassifierFreeWrapper
 
+import smplx
+
 debug = 0
 
 @dataclass
@@ -71,6 +73,29 @@ class OptimArgs:
 
 
 import torch.nn.functional as F
+
+
+def sample_scene_points(smpl_output, scene_vertices):
+
+    # TODO: generate SMPL model based on current pose
+
+
+
+
+
+
+    points = scene_vertices.clone()
+    # remove points that are well outside the SMPL bounding box
+    bb_min = smpl_output.vertices.min(1).values.reshape(1, 3)
+    bb_max = smpl_output.vertices.max(1).values.reshape(1, 3)
+
+    inds = (scene_vertices >= bb_min).all(-1) & (scene_vertices <= bb_max).all(-1)
+    if not inds.any():
+        return None
+    points = scene_vertices[inds]
+    return points.float().reshape(1, -1, 3)  # add batch dimension
+
+
 def calc_point_sdf(scene_assets, points):
 
     # TODO what is scene assets, do we need to change it or can we load it in volumetricSMPL?
@@ -218,6 +243,12 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
                                                                                                     transf_transl)
         global_joints = motion_sequences['joints']  # [B, T, 22, 3]
         B, T, _, _ = global_joints.shape
+
+        # replace
+
+        # TODO: what is smpl_output in our case??
+        points = sample_scene_points(smpl_output, scene_assets['scene_vertices'])
+
         joints_sdf = calc_point_sdf(scene_assets, global_joints.reshape(1, -1, 3)).reshape(B, T, 22)
         foot_joints_sdf = joints_sdf[:, :, FOOT_JOINTS_IDX]  # [B, T, 2]
         loss_floor_contact = (foot_joints_sdf.amin(dim=-1) - optim_args.contact_thresh).clamp(min=0).mean()
@@ -308,8 +339,9 @@ if __name__ == '__main__':
     scene_sdf_grid = np.load(scene_dir / 'scene_sdf.npy')
     scene_sdf_grid = torch.tensor(scene_sdf_grid, dtype=torch.float32, device=device).unsqueeze(
         0)  # [1, size, size, size]
-
+    scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
     scene_assets = {
+        'scene_vertices': scene_vertices,
         'scene_with_floor_mesh': scene_with_floor_mesh,
         'scene_sdf_grid': scene_sdf_grid,
         'scene_sdf_config': scene_sdf_config,
