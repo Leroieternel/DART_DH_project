@@ -38,8 +38,12 @@ from mld.train_mld import DenoiserArgs, MLDArgs, create_gaussian_diffusion, Deno
 from mld.rollout_mld import load_mld, ClassifierFreeWrapper
 
 import smplx
+from VolumetricSMPL import attach_volume
+from pytorch3d.transforms import matrix_to_axis_angle
 
 debug = 0
+
+NUM_POINTS_SAMPLE_FOR_VOLSMPL = 10000
 
 @dataclass
 class OptimArgs:
@@ -77,12 +81,7 @@ import torch.nn.functional as F
 
 def sample_scene_points(smpl_output, scene_vertices):
 
-    # TODO: generate SMPL model based on current pose
-
-
-
-
-
+    # TODO: sample points on the mesh
 
     points = scene_vertices.clone()
     # remove points that are well outside the SMPL bounding box
@@ -92,14 +91,23 @@ def sample_scene_points(smpl_output, scene_vertices):
     inds = (scene_vertices >= bb_min).all(-1) & (scene_vertices <= bb_max).all(-1)
     if not inds.any():
         return None
-    points = scene_vertices[inds]
-    return points.float().reshape(1, -1, 3)  # add batch dimension
+
+    faces_within_bb = [
+        face for face in scene_faces if any(inds[v.item()].item() for v in face)
+    ]
+
+    faces_within_bb = torch.stack(faces_within_bb)
+
+    partial_mesh = trimesh.Trimesh(vertices=scene_vertices.cpu().numpy(), faces=faces_within_bb.cpu().numpy(), process=False)
+    sampled_points = partial_mesh.sample(NUM_POINTS_SAMPLE_FOR_VOLSMPL)
+
+    # points = scene_vertices[inds]
+    # print(sampled_points.shape, points.shape)
+
+    return torch.from_numpy(sampled_points).float().reshape(1, -1, 3).to(scene_vertices.device)  # add batch dimension
 
 
 def calc_point_sdf(scene_assets, points):
-
-    # TODO what is scene assets, do we need to change it or can we load it in volumetricSMPL?
-
     device = points.device
     scene_sdf_config = scene_assets['scene_sdf_config']
     scene_sdf_grid = scene_assets['scene_sdf_grid']
@@ -244,22 +252,47 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
         global_joints = motion_sequences['joints']  # [B, T, 22, 3]
         B, T, _, _ = global_joints.shape
 
-        # replace
+        # print(motion_sequences.keys())
+        # print(motion_sequences["transl"][0][0].reshape(1, -1).shape)
+        # print(matrix_to_axis_angle(motion_sequences["global_orient"][0][0]).reshape(1, -1).shape)
+        # print(matrix_to_axis_angle(motion_sequences["body_pose"][0][0]).reshape(1, -1).shape)
 
-        # TODO: what is smpl_output in our case??
-        points = sample_scene_points(smpl_output, scene_assets['scene_vertices'])
+        # Sadly reshaping like this does not work?
+        # So below i jsut iterate over everything, not optimised
+        # print(motion_sequences["transl"].reshape(B*T, 3).shape)
+        # print(matrix_to_axis_angle(motion_sequences["global_orient"]).reshape(B*T, 3).shape)
+        # print(matrix_to_axis_angle(motion_sequences["body_pose"]).reshape(B*T, 21 * 3).shape) # TODO: 21 probably shouldnt be hardcoded..
+
+        # Convert to format of
+        # https://github.com/vchoutas/smplx/blob/1265df7ba545e8b00f72e7c557c766e15c71632f/smplx/body_models.py#L1158
+        loss_collision = 0
+        for b in range(B):
+            for t in range(T):
+                smpl_output = scene_assets["smpl"](
+                    transl=motion_sequences["transl"][b][t].reshape(1, -1),
+                    global_orient=matrix_to_axis_angle(motion_sequences["global_orient"][b][t]).reshape(1, -1),
+                    body_pose=matrix_to_axis_angle(motion_sequences["body_pose"][b][t]).reshape(1, -1),
+                    return_verts=True, return_full_pose=True)
+
+            points = sample_scene_points(smpl_output, scene_assets['scene_vertices'])
+
+            if points is None:
+                # No scene mesh points within bounding box
+                continue
+            else:
+                selfpen_loss, _collision_mask = model.volume.collision_loss(points, smpl_output, ret_collision_mask=True)
+                loss_collision += selfpen_loss
+
 
         joints_sdf = calc_point_sdf(scene_assets, global_joints.reshape(1, -1, 3)).reshape(B, T, 22)
         foot_joints_sdf = joints_sdf[:, :, FOOT_JOINTS_IDX]  # [B, T, 2]
         loss_floor_contact = (foot_joints_sdf.amin(dim=-1) - optim_args.contact_thresh).clamp(min=0).mean()
-        negative_sdf_per_frame = (joints_sdf - joint_skin_dist.reshape(1, 1, 22)).clamp(max=0).sum(
-            dim=-1)  # [B, T], clip negative sdf, sum over joints
-        negative_sdf_mean = negative_sdf_per_frame.mean()
 
-        # TODO: probably need to change things here
-        # https://github.com/markomih/VolumetricSMPL_applications/blob/main/tutorials/scene_collisions.py
+        # negative_sdf_per_frame = (joints_sdf - joint_skin_dist.reshape(1, 1, 22)).clamp(max=0).sum(
+        #    dim=-1)  # [B, T], clip negative sdf, sum over joints
+        # negative_sdf_mean = negative_sdf_per_frame.mean()
+        # loss_collision = -negative_sdf_mean
 
-        loss_collision = -negative_sdf_mean
         loss_joints = criterion(motion_sequences['joints'][:, -1, joints_mask], goal_joints[:, joints_mask])
         loss_jerk = calc_jerk(motion_sequences['joints'])
         loss = loss_joints + optim_args.weight_collision * loss_collision + optim_args.weight_jerk * loss_jerk + optim_args.weight_contact * loss_floor_contact
@@ -340,8 +373,16 @@ if __name__ == '__main__':
     scene_sdf_grid = torch.tensor(scene_sdf_grid, dtype=torch.float32, device=device).unsqueeze(
         0)  # [1, size, size, size]
     scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
+    scene_faces = torch.from_numpy(scene_with_floor_mesh.faces).to(device=device, dtype=torch.int64)
+
+    # create a SMPL body and attach volumetric body
+    model = smplx.create(model_path="./data/smplx_lockedhead_20230207/models_lockedhead/smplx/SMPLX_NEUTRAL.npz", gender='neutral', use_pca=True, num_pca_comps=12, num_betas=10)
+    model = attach_volume(model, pretrained=True, device=device)
+
     scene_assets = {
+        'smpl': model,
         'scene_vertices': scene_vertices,
+        'scene_faces': scene_faces,
         'scene_with_floor_mesh': scene_with_floor_mesh,
         'scene_sdf_grid': scene_sdf_grid,
         'scene_sdf_config': scene_sdf_config,
