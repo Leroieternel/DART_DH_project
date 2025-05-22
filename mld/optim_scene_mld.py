@@ -43,7 +43,7 @@ from pytorch3d.transforms import matrix_to_axis_angle
 
 debug = 0
 
-NUM_POINTS_SAMPLE_FOR_VOLSMPL = 10000
+NUM_POINTS_SAMPLE_FOR_VOLSMPL = 100
 
 @dataclass
 class OptimArgs:
@@ -78,12 +78,25 @@ class OptimArgs:
 
 import torch.nn.functional as F
 
+# Adapted from VolSMPL
+def batchify_smpl_output(smpl_output):
+    b_smpl_output_list = []
+    batch_size = smpl_output.vertices.shape[0]
+    for b_ind in range(batch_size):
+        b_smpl_output_list.append(copy.copy(smpl_output))
+        for key in b_smpl_output_list[-1].keys():
+            val = getattr(smpl_output, key)
+            if torch.is_tensor(val):
+                val = val[b_ind:b_ind+1].clone()
+            setattr(b_smpl_output_list[-1], key, val)
+    return b_smpl_output_list
 
 def sample_scene_points(smpl_output, scene_vertices):
 
     # TODO: sample points on the mesh
 
-    points = scene_vertices.clone()
+    # print(smpl_output.vertices.shape)
+
     # remove points that are well outside the SMPL bounding box
     bb_min = smpl_output.vertices.min(1).values.reshape(1, 3)
     bb_max = smpl_output.vertices.max(1).values.reshape(1, 3)
@@ -103,7 +116,7 @@ def sample_scene_points(smpl_output, scene_vertices):
 
     # points = scene_vertices[inds]
     # print(sampled_points.shape, points.shape)
-
+    #
     return torch.from_numpy(sampled_points).float().reshape(1, -1, 3).to(scene_vertices.device)  # add batch dimension
 
 
@@ -227,7 +240,7 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
 
         return motion_sequences, history_motion, transf_rotmat, transf_transl
 
-    optim_steps = optim_args.optim_steps
+    optim_steps = 1# optim_args.optim_steps
     lr = optim_args.optim_lr
     noise = torch.randn(num_rollout, batch_size, *denoiser_args.model_args.noise_shape,
                         device=device, dtype=torch.float32)
@@ -265,6 +278,11 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
 
         # Convert to format of
         # https://github.com/vchoutas/smplx/blob/1265df7ba545e8b00f72e7c557c766e15c71632f/smplx/body_models.py#L1158
+
+        with open('test.pkl', 'wb') as f:
+            pickle.dump(motion_sequences, f)
+        exit()
+
         loss_collision = 0
         for b in range(B):
             for t in range(T):
@@ -275,14 +293,13 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
                     return_verts=True, return_full_pose=True)
 
             points = sample_scene_points(smpl_output, scene_assets['scene_vertices'])
-
             if points is None:
                 # No scene mesh points within bounding box
                 continue
             else:
                 selfpen_loss, _collision_mask = model.volume.collision_loss(points, smpl_output, ret_collision_mask=True)
                 loss_collision += selfpen_loss
-
+                del points
 
         joints_sdf = calc_point_sdf(scene_assets, global_joints.reshape(1, -1, 3)).reshape(B, T, 22)
         foot_joints_sdf = joints_sdf[:, :, FOOT_JOINTS_IDX]  # [B, T, 2]
@@ -308,9 +325,97 @@ def optimize(history_motion_tensor, transf_rotmat, transf_transl, text_prompt, g
         if torch.is_tensor(motion_sequences[key]):
             motion_sequences[key] = motion_sequences[key].detach()
     motion_sequences['texts'] = texts
+
     return motion_sequences, new_history_motion_tensor.detach(), new_transf_rotmat.detach(), new_transf_transl.detach()
 
 if __name__ == '__main__':
+
+    optim_args = tyro.cli(OptimArgs)
+    device = torch.device(optim_args.device if torch.cuda.is_available() else "cpu")
+    print(device)
+
+    with open('test.pkl', 'rb') as f:
+        motion_sequences = pickle.load(f)
+
+    global_joints = motion_sequences['joints']  # [B, T, 22, 3]
+    B, T, _, _ = global_joints.shape
+
+    model = smplx.create(model_path="./data/smplx_lockedhead_20230207/models_lockedhead/smplx/SMPLX_NEUTRAL.npz", gender='neutral', use_pca=True, num_pca_comps=12, num_betas=10, batch_size=B*T).to(device)
+    model = attach_volume(model, pretrained=True, device=device)
+
+    import time
+
+    start = time.time()
+
+    _, _, J, _, _ = motion_sequences["body_pose"].shape
+
+    transl = motion_sequences["transl"].reshape(B*T, 3)
+    global_orient = matrix_to_axis_angle(motion_sequences["global_orient"]).reshape(B*T, 3)
+    body_pose = matrix_to_axis_angle(motion_sequences["body_pose"]).reshape(B*T, J*3)
+
+    smpl_output = model(
+        transl=transl,
+        global_orient=global_orient,
+        body_pose=body_pose,
+        return_verts=True, return_full_pose=True)
+
+    print(smpl_output.vertices.shape)
+
+    smpl_output_batch = batchify_smpl_output(smpl_output) # B*T
+    del smpl_output # gpu memory efficiency :)
+
+    end = time.time()
+    print(f"Finished Generating SMLPLX in: {end - start:.4f} seconds")
+
+
+    with open(optim_args.interaction_cfg, 'r') as f:
+        interaction_cfg = json.load(f)
+    interaction_name = interaction_cfg['interaction_name'].replace(' ', '_')
+    scene_dir = Path(interaction_cfg['scene_dir'])
+    scene_dir = Path(scene_dir)
+    scene_with_floor_mesh = trimesh.load(scene_dir / 'scene_with_floor.obj', process=False, force='mesh')
+
+    with open(scene_dir / 'scene_sdf.json', 'r') as f:
+        scene_sdf_config = json.load(f)
+    scene_sdf_grid = np.load(scene_dir / 'scene_sdf.npy')
+    scene_sdf_grid = torch.tensor(scene_sdf_grid, dtype=torch.float32, device=device).unsqueeze(
+        0)  # [1, size, size, size]
+
+
+    scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
+    scene_faces = torch.from_numpy(scene_with_floor_mesh.faces).to(device=device, dtype=torch.int64)
+
+    print(scene_vertices.shape)
+    print(scene_faces.shape)
+
+    start = time.time()
+
+    scene_with_floor_mesh = trimesh.load(scene_dir / 'scene_with_floor.obj', process=False, force='mesh')
+    sampled_points = scene_with_floor_mesh.sample(NUM_POINTS_SAMPLE_FOR_VOLSMPL)
+    sampled_points = torch.from_numpy(sampled_points).float().to(device).reshape(1, -1, 3)
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1024 ** 2:.2f} MB")
+
+    print(sampled_points.shape)
+    # torch.from_numpy(sampled_points).float().reshape(1, -1, 3).to(scene_vertices.device)  # add batch dimension
+
+    # Need to batch because there is not enough memory!
+    total_loss = 0
+    for batch in smpl_output_batch:
+        loss = model.volume.collision_loss(sampled_points, batch,  ret_collision_mask=None) # ret_collision_mask does not work, it is still returned...
+
+        if loss > 0:
+            total_loss += loss
+
+        del loss # try to save gpu memory
+        del batch # try to save gpu memory
+
+    print(total_loss)
+
+    end = time.time()
+    print(f"Finished Sampling Points in: {end - start:.4f} seconds")
+
+    exit(0)
+
     optim_args = tyro.cli(OptimArgs)
     # TRY NOT TO MODIFY: seeding
     random.seed(optim_args.seed)
@@ -362,20 +467,18 @@ if __name__ == '__main__':
     scene_dir = Path(scene_dir)
     scene_with_floor_mesh = trimesh.load(scene_dir / 'scene_with_floor.obj', process=False, force='mesh')
 
-    # TODO: load like this?
-    # scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
-    # scene_normals = torch.from_numpy(np.asarray(scene_with_floor_mesh.vertex_normals).copy()).to(device=device, dtype=torch.float)
-    # Now what? scene_assets?
-
     with open(scene_dir / 'scene_sdf.json', 'r') as f:
         scene_sdf_config = json.load(f)
     scene_sdf_grid = np.load(scene_dir / 'scene_sdf.npy')
     scene_sdf_grid = torch.tensor(scene_sdf_grid, dtype=torch.float32, device=device).unsqueeze(
         0)  # [1, size, size, size]
+
+
     scene_vertices = torch.from_numpy(scene_with_floor_mesh.vertices).to(device=device, dtype=torch.float)
     scene_faces = torch.from_numpy(scene_with_floor_mesh.faces).to(device=device, dtype=torch.int64)
 
     # create a SMPL body and attach volumetric body
+    # TODO: add betas?
     model = smplx.create(model_path="./data/smplx_lockedhead_20230207/models_lockedhead/smplx/SMPLX_NEUTRAL.npz", gender='neutral', use_pca=True, num_pca_comps=12, num_betas=10)
     model = attach_volume(model, pretrained=True, device=device)
 
@@ -509,5 +612,18 @@ if __name__ == '__main__':
             }
             with open(out_path / f'sample_{idx}_smplx.npz', 'wb') as f:
                 np.savez(f, **data_dict)
+
+            # T, _ = sequence["transl"].shape
+            # for t in range(T):
+
+            #     smpl_output = scene_assets["smpl"](
+            #         transl=sequence["transl"][t].reshape(-1),
+            #         global_orient=matrix_to_axis_angle(sequence["global_orient"][t]).reshape(-1),
+            #         body_pose=matrix_to_axis_angle(sequence["body_pose"][t]).reshape(-1),
+            #         return_verts=True, return_full_pose=True)
+
+            #     points = sample_scene_points(smpl_output, scene_assets['scene_vertices'])
+            #     print(points.shape)
+            #     del points
 
     print(f'[Done] Results are at [{out_path.absolute()}]')
